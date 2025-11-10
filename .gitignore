@@ -9,3 +9,9 @@ venv/
 # IDE specific
 .idea/
 .vscode/
+
+# 코드만 업로드
+*.md
+captured_scores/
+config.ini
+final_sheet_music_stitched.pdf
