@@ -14,4 +14,4 @@ venv/
 *.md
 captured_scores/
 config.ini
-final_sheet_music_stitched.pdf
+*.pdf

@@ -1,6 +1,6 @@
 import os
-import sys
 import time
+from datetime import datetime
 import cv2
 import mss
 import numpy as np
@@ -22,7 +22,6 @@ QUEUE_POLL_MS = 100  # 큐 확인 간격 (ms)
 # --- 메인 애플리케이션 클래스 ---
 class ScoreCaptureApp:
     def __init__(self, root):
-        # --- 기본 설정 ---
         self.root = root
         self.root.title("악보 자동 캡처")
 
@@ -34,40 +33,39 @@ class ScoreCaptureApp:
         x_pos = (screen_width // 2) - (app_width // 2)
         y_pos = (screen_height // 2) - (app_height // 2)
         self.root.geometry(f"{app_width}x{app_height}+{x_pos}+{y_pos}")
-        self.root.resizable(False, False)  # 창 크기 조절 불가
-
-        # --- (개선) 항상 위에 떠있는 창으로 설정 ---
+        self.root.resizable(False, False)
         self.root.attributes('-topmost', 1)
 
-        # --- 상태 변수 ---
         self.capture_area = None
         self.is_capturing = False
         self.last_captured_image_gray = None
         self.captured_image_files = []
 
-        # --- 스레드 및 큐 관련 ---
+        # 캡처 영역 선택 시 필요한 변수들
+        self.monitor_info = None
+        self.virtual_screen_offset_x = 0
+        self.virtual_screen_offset_y = 0
+
         self.capture_thread = None
         self.pdf_thread = None
-        self.message_queue = queue.Queue()  # 스레드 -> GUI 통신용
+        self.message_queue = queue.Queue()
 
-        # --- UI 위젯 생성 ---
         self.create_widgets()
         self.load_config()
 
-        # --- 큐 폴링 시작 ---
+        # 앱 시작 시 즉시 모니터 상태 확인
+        self._check_monitor_status()
+
         self.root.after(QUEUE_POLL_MS, self._process_queue)
 
-        # --- 종료 시 처리 ---
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def create_widgets(self):
-        # --- 프레임 설정 ---
         frame = ttk.Frame(self.root, padding="10")
-        frame.grid(row=0, column=0, sticky=(tk.W + tk.E + tk.N + tk.S))  # sticky 수정
+        frame.grid(row=0, column=0, sticky=(tk.W + tk.E + tk.N + tk.S))
 
-        # --- 설정 값 입력 UI ---
         ttk.Label(frame, text="민감도 (0.0-1.0):").grid(row=0, column=0, sticky=tk.W, pady=2)
-        self.similarity_var = tk.StringVar(value="0.7")  # 기본값 0.7로 변경
+        self.similarity_var = tk.StringVar(value="0.7")
         self.similarity_entry = ttk.Entry(frame, textvariable=self.similarity_var, width=10)
         self.similarity_entry.grid(row=0, column=1, sticky=tk.W)
 
@@ -76,30 +74,41 @@ class ScoreCaptureApp:
         self.delay_entry = ttk.Entry(frame, textvariable=self.delay_var, width=10)
         self.delay_entry.grid(row=1, column=1, sticky=tk.W)
 
-        # --- 버튼 UI ---
         self.select_button = ttk.Button(frame, text="1. 캡처 영역 선택", command=self.select_capture_area)
-        self.select_button.grid(row=2, column=0, columnspan=2, sticky=(tk.W + tk.E), pady=10)  # sticky 수정
+        self.select_button.grid(row=2, column=0, columnspan=2, sticky=(tk.W + tk.E), pady=10)
 
         self.start_button = ttk.Button(frame, text="2. 캡처 시작", command=self.start_capture, state=tk.DISABLED)
-        self.start_button.grid(row=3, column=0, sticky=(tk.W + tk.E))  # sticky 수정
+        self.start_button.grid(row=3, column=0, sticky=(tk.W + tk.E))
 
         self.stop_button = ttk.Button(frame, text="종료 및 PDF 생성", command=self.stop_capture, state=tk.DISABLED)
-        self.stop_button.grid(row=3, column=1, sticky=(tk.W + tk.E))  # sticky 수정
+        self.stop_button.grid(row=3, column=1, sticky=(tk.W + tk.E))
 
-        # --- 상태 표시줄 ---
-        self.status_var = tk.StringVar(value="영역을 먼저 선택해주세요.")
+        self.status_var = tk.StringVar(value="초기화 중...")
         status_label = ttk.Label(self.root, textvariable=self.status_var, padding="10 5", relief=tk.SUNKEN)
-        status_label.grid(row=1, column=0, sticky=(tk.W + tk.E + tk.S))  # sticky 수정
+        status_label.grid(row=1, column=0, sticky=(tk.W + tk.E + tk.S))
 
     def update_status(self, message):
         self.status_var.set(message)
         self.root.update_idletasks()
 
+    def _check_monitor_status(self):
+        try:
+            with mss.mss() as sct:
+                monitor_count = len(sct.monitors) - 1  # 0번(전체) 모니터 제외
+                if monitor_count > 1:
+                    status_msg = f"다중 모니터({monitor_count}개) 감지됨. 영역을 선택하세요."
+                else:
+                    status_msg = "단일 모니터 감지됨. 영역을 선택하세요."
+                self.status_var.set(status_msg)
+        except Exception as e:
+            print(f"모니터 감지 오류: {e}")
+            self.status_var.set("준비 완료. 영역을 선택하세요.")
+
     def load_config(self):
         config = configparser.ConfigParser()
         if os.path.exists(CONFIG_FILE):
             config.read(CONFIG_FILE)
-            threshold = config.get('Settings', 'similarity_threshold', fallback='0.7')  # fallback 0.7로
+            threshold = config.get('Settings', 'similarity_threshold', fallback='0.7')
             self.similarity_var.set(threshold)
 
     def save_config(self):
@@ -110,58 +119,62 @@ class ScoreCaptureApp:
 
     def select_capture_area(self):
         try:
+            # 캡처할 모니터 정보 미리 저장
             with mss.mss() as sct:
-                # 1. (개선) 모니터 정보 감지 및 콘솔(print)이 아닌 상태바(update_status)에 표시
-                monitor_count = len(sct.monitors) - 1  # 0번(전체) 모니터 제외
-                if monitor_count > 1:
-                    status_msg = f"다중 모니터({monitor_count}개) 감지됨. 전체 화면에서 선택하세요..."
-                else:
-                    status_msg = "단일 모니터 감지됨. 화면에서 선택하세요..."
-                self.update_status(status_msg)
-                self.root.update_idletasks()  # 상태바 메시지 즉시 업데이트
-
-                # 2. (개선) withdraw() 대신 '투명화'로 깜빡임 제거
-                self.root.attributes('-alpha', 0.0)
-                # OS가 창을 투명하게 처리할 시간을 줌 (0.1~0.2초)
-                time.sleep(0.6)
-
-                # 3. 전체 가상 화면(모든 모니터) 캡처
-                sct_img = sct.grab(sct.monitors[0])
-                screenshot = cv2.cvtColor(np.array(sct_img), cv2.COLOR_BGRA2BGR)
-
-                # 4. (개선) 캡처 직후 즉시 창 복원
-                self.root.attributes('-alpha', 1.0)
-
-                # 가상 화면의 시작점(좌표 보정용)
-                virtual_screen_offset_x = sct.monitors[0]["left"]
-                virtual_screen_offset_y = sct.monitors[0]["top"]
-
-        except mss.exception.ScreenShotError as e:
-            self.update_status("화면 캡처 실패. 다시 시도하세요.")
-            self.root.attributes('-alpha', 1.0)  # 오류 발생 시 창 복원
-            print(f"캡처 오류: {e}")
+                self.monitor_info = sct.monitors[0]  # 전체 가상 화면
+                self.virtual_screen_offset_x = self.monitor_info["left"]
+                self.virtual_screen_offset_y = self.monitor_info["top"]
+        except Exception as e:
+            self.update_status(f"모니터 감지 오류: {e}")
             return
 
-        # 5. 캡처한 스크린샷으로 영역 선택 창 띄우기
-        selector = AreaSelector(screenshot)
-        selected_rect = selector.select_area("캡처할 '악보 전체 영역'을 마우스로 드래그하세요.")
+        # 3초 카운트다운 시작 (창 숨기지 않음)
+        self._selection_countdown(3)
 
-        # 6. 메인 창 포커스 복원
-        self.root.deiconify()  # 최소화되었을 경우를 대비
-        self.root.focus_force()  # 창을 맨 앞으로 가져옴
-
-        if selected_rect:
-            # 선택된 좌표를 mss가 사용할 가상 화면 절대 좌표로 변환
-            self.capture_area = {
-                'top': selected_rect['top'] + virtual_screen_offset_y,
-                'left': selected_rect['left'] + virtual_screen_offset_x,
-                'width': selected_rect['width'],
-                'height': selected_rect['height']
-            }
-            self.update_status("영역 선택 완료. 캡처를 시작하세요.")
-            self.start_button.config(state=tk.NORMAL)
+    def _selection_countdown(self, count):
+        """영역 선택 전 3초 카운트다운을 수행하여 재생바 숨길 시간 확보"""
+        if count > 0:
+            self.update_status(f"{count}초 후 화면 캡처... [악보] 창을 클릭하세요!")
+            self.select_button.config(state=tk.DISABLED)  # 버튼 비활성화
+            self.root.after(1000, self._selection_countdown, count - 1)
         else:
-            self.update_status("영역 선택이 취소되었습니다.")
+            # 카운트다운 종료, 화면 캡처 실행
+            self.update_status("화면 캡처 중...")
+
+            try:
+                with mss.mss() as sct:
+                    sct_img = sct.grab(self.monitor_info)
+                    screenshot = cv2.cvtColor(np.array(sct_img), cv2.COLOR_BGRA2BGR)
+            except mss.exception.ScreenShotError as e:
+                self.update_status("화면 캡처 실패. 다시 시도하세요.")
+                self.select_button.config(state=tk.NORMAL)  # 버튼 활성화
+                print(f"캡처 오류: {e}")
+                return
+
+            # 캡처 완료 후 버튼 다시 활성화
+            self.select_button.config(state=tk.NORMAL)
+
+            # 캡처한 스크린샷으로 영역 선택 창 띄우기
+            selector = AreaSelector(screenshot)
+            selected_rect = selector.select_area("캡처할 '악보 전체 영역'을 마우스로 드래그하세요.")
+
+            self.root.deiconify()
+            self.root.focus_force()  # 메인 창 다시 포커스
+
+            if selected_rect:
+                # 선택된 좌표를 가상 화면 절대 좌표로 변환
+                self.capture_area = {
+                    'top': selected_rect['top'] + self.virtual_screen_offset_y,
+                    'left': selected_rect['left'] + self.virtual_screen_offset_x,
+                    'width': selected_rect['width'],
+                    'height': selected_rect['height']
+                }
+                self.update_status("영역 선택 완료. 캡처를 시작하세요.")
+                self.start_button.config(state=tk.NORMAL)
+            else:
+                self._check_monitor_status()  # 취소 시 모니터 상태로 복귀
+
+    # --- 캡처 시작 및 스레드 루프 ---
 
     def start_capture(self):
         try:
@@ -212,24 +225,36 @@ class ScoreCaptureApp:
                     current_image_gray = cv2.cvtColor(current_image_bgr, cv2.COLOR_BGRA2GRAY)
 
                     if self.last_captured_image_gray is None:
-                        # (개선) 첫 이미지 저장 시 카운트 표시
                         self.save_image(current_image_bgr)
                         self.message_queue.put(('status', "첫 악보 감지! (1번째 저장)"))
-                        self.last_captured_image_gray = current_image_gray  # 저장 후 비교 이미지 할당
+                        self.last_captured_image_gray = current_image_gray
                     else:
-                        score, _ = compare_ssim(self.last_captured_image_gray, current_image_gray, full=True)
+                        # 재생바 무시를 위해 상위 80%만 비교
+                        h, w = current_image_gray.shape
+                        # 상위 80% 높이 계산 (하단 20% 무시)
+                        crop_h = int(h * 0.80)
+
+                        # 비교할 영역만 잘라내기
+                        img_last_cropped = self.last_captured_image_gray[0:crop_h, :]
+                        img_current_cropped = current_image_gray[0:crop_h, :]
+
+                        # 잘라낸 이미지로만 유사도 비교
+                        score, _ = compare_ssim(img_last_cropped, img_current_cropped, full=True)
+
                         if score < threshold:
-                            # (개선) 새 이미지 저장 시 카운트 표시
                             self.save_image(current_image_bgr)
                             count = len(self.captured_image_files)
                             self.message_queue.put(('status', f"새 악보 감지! ({count}번째 저장 / 유사도: {score:.2f})"))
-                            self.last_captured_image_gray = current_image_gray  # 저장 후 비교 이미지 할당
+                            self.last_captured_image_gray = current_image_gray  # 비교 대상은 원본으로 갱신
 
                     elapsed = time.time() - start_time
                     sleep_time = CAPTURE_INTERVAL_SEC - elapsed
                     if sleep_time > 0:
                         time.sleep(sleep_time)
 
+        except mss.exception.ScreenShotError as e:
+            # 캡처 영역이 (모니터 변경 등으로) 유효하지 않게 된 경우
+            self.message_queue.put(('error', f"캡처 영역 오류: 영역이 화면을 벗어난 것 같습니다. 앱을 재시작하고 영역을 다시 선택해주세요. ({e})"))
         except Exception as e:
             self.message_queue.put(('error', f"캡처 오류 발생: {e}"))
         finally:
@@ -252,14 +277,13 @@ class ScoreCaptureApp:
 
             image_list = [Image.open(f) for f in self.captured_image_files]
 
-            pdf_filename = "final_sheet_music_stitched.pdf"
+            # PDF 파일명에 타임스탬프 추가
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            pdf_filename = f"score-{timestamp}.pdf"
 
             image_list[0].save(
-                pdf_filename,
-                "PDF",
-                resolution=100.0,
-                save_all=True,
-                append_images=image_list[1:]
+                pdf_filename, "PDF", resolution=100.0,
+                save_all=True, append_images=image_list[1:]
             )
 
             self.message_queue.put(('pdf_done', (pdf_filename, f"'{pdf_filename}' 파일이 성공적으로 생성되었습니다.")))
@@ -274,7 +298,8 @@ class ScoreCaptureApp:
         self.start_button.config(state=tk.NORMAL if self.capture_area else tk.DISABLED)
         self.select_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED)
-        self.update_status("준비 완료. 영역을 선택하거나 캡처를 시작하세요.")
+        # 상태 초기화 시 모니터 상태로 복귀
+        self._check_monitor_status()
 
     def _process_queue(self):
         try:
@@ -282,19 +307,15 @@ class ScoreCaptureApp:
 
             if message_type == 'status':
                 self.update_status(value)
-
             elif message_type == 'error':
                 messagebox.showerror("오류 발생", value)
                 self.reset_state()
-
             elif message_type == 'capture_stopped':
-                # 캡처 스레드 종료 확인 후 PDF 생성 스레드 시작
                 self.pdf_thread = threading.Thread(
                     target=self._pdf_creation_thread_target,
                     daemon=True
                 )
                 self.pdf_thread.start()
-
             elif message_type == 'pdf_done':
                 pdf_filename, message = value
                 if pdf_filename:
@@ -344,8 +365,10 @@ class AreaSelector:
         cv2.putText(img_with_text, instructions, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2, cv2.LINE_AA)
         cv2.imshow("Area Selector", img_with_text)
 
+        # AreaSelector 창이 모든 창 위에 오도록 시도
+        cv2.setWindowProperty("Area Selector", cv2.WND_PROP_TOPMOST, 1)
+
         while not self.rect_done:
-            # ESC 키로 취소
             if cv2.waitKey(1) & 0xFF == 27:
                 cv2.destroyAllWindows()
                 return None
@@ -357,7 +380,6 @@ class AreaSelector:
         width = abs(self.point1[0] - self.point2[0])
         height = abs(self.point1[1] - self.point2[1])
 
-        # 유효하지 않은 영역(크기가 0) 선택 방지
         if width == 0 or height == 0:
             return None
 
@@ -366,7 +388,6 @@ class AreaSelector:
 
 # --- 프로그램 실행 ---
 if __name__ == "__main__":
-    # Windows에서 DPI 인식 관련 문제 해결 (선명한 GUI)
     if os.name == 'nt':
         try:
             from ctypes import windll
