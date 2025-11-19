@@ -13,5 +13,4 @@ venv/
 # 코드만 업로드
 *.md
 captured_scores/
-config.ini
 *.pdf

@@ -174,8 +174,6 @@ class ScoreCaptureApp:
             else:
                 self._check_monitor_status()  # 취소 시 모니터 상태로 복귀
 
-    # --- 캡처 시작 및 스레드 루프 ---
-
     def start_capture(self):
         try:
             delay = int(self.delay_var.get())
